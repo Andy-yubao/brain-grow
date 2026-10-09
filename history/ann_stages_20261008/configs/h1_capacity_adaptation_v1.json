@@ -1,0 +1,17 @@
+{
+  "version": "h1_capacity_adaptation_v1",
+  "model_seed": 11,
+  "data_seed": 20261004,
+  "epochs": 8,
+  "parent_epoch": 8,
+  "batch_size": 64,
+  "evaluation_batch_size": 512,
+  "learning_rate": 0.00001723144441142776,
+  "minimum_learning_rate": 0.00001723144441142776,
+  "sensitivity_ema": 0.9,
+  "accuracy_floor": 0.965,
+  "accuracy_drop": 0.005,
+  "loss_increase": 0.025,
+  "wall_seconds_per_arm": 1200,
+  "peak_memory_limit_bytes": 8589934592
+}

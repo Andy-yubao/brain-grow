@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "braingrow"
+version = "0.0.0"
+description = "Research workspace for adaptive, growing neural networks"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26,<3", "Pillow>=10,<13"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+train = ["torch==2.13.0"]
+
+[project.scripts]
+braingrow = "braingrow.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

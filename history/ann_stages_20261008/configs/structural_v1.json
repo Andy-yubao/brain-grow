@@ -1,0 +1,22 @@
+{
+  "version": "structural_v1",
+  "model_seed": 11,
+  "data_seed": 20261004,
+  "arms": ["fc", "prune", "share", "joint", "cnn"],
+  "batch_size": 64,
+  "evaluation_batch_size": 512,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0,
+  "edit_fraction": 0.05,
+  "gradient_decay": 0.9,
+  "accuracy_tolerance": 0.01,
+  "loss_tolerance": 0.05,
+  "screen_samples": 256,
+  "minimum_storage_reduction": 0.2,
+  "maximum_runtime_ratio": 3.0,
+  "tasks": {
+    "synthetic_translated": {"widths": [64, 128, 2], "epochs": 15, "warmup_epochs": 3, "max_proposals": 20, "lr_milestones": [6, 11], "learning_floor": 0.9},
+    "synthetic_fixed": {"widths": [64, 128, 2], "epochs": 15, "warmup_epochs": 3, "max_proposals": 20, "lr_milestones": [6, 11], "learning_floor": 0.9},
+    "mnist_static": {"widths": [784, 512, 256, 10], "epochs": 25, "warmup_epochs": 5, "max_proposals": 40, "lr_milestones": [11, 21], "learning_floor": 0.9}
+  }
+}

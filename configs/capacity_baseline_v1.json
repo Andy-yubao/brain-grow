@@ -1,0 +1,19 @@
+{
+  "version": "capacity_baseline_v1",
+  "model_seed": 11,
+  "data_seed": 20261004,
+  "cnn_channels": [16, 32],
+  "cnn_hidden": 128,
+  "fc_widths": [784, 6272, 3136, 256, 10],
+  "epochs": 50,
+  "batch_size": 64,
+  "evaluation_batch_size": 512,
+  "learning_rate": 0.001,
+  "minimum_learning_rate": 0.00001,
+  "weight_decay": 0.0001,
+  "dropout": 0.2,
+  "augmentation_degrees": 12,
+  "augmentation_translation_fraction": 0.08,
+  "accuracy_floor": 0.965,
+  "minimum_epochs": 25
+}

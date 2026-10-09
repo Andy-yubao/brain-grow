@@ -1,0 +1,9 @@
+{
+  "maximum_epochs": 25,
+  "control_interval_epochs": 2,
+  "fit_interval_epochs": 5,
+  "evaluate_final_epoch": true,
+  "epoch_accounting": "total_including_resume",
+  "learning_rate_policy": "control_loss_plateau",
+  "note": "下一轮新数据SNN基线的总预算；尚未启动。恢复不重置轮数，达到25轮后不自动延长。"
+}

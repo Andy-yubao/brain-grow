@@ -1,0 +1,30 @@
+# 环境、凭据及生成物
+.venv/
+.conda/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.env
+.env.*
+!.env.example
+/data/
+/artifacts/
+/tmp/
+/.tmp/
+/experiments/runs/
+/experiments/tmp-pip/
+# 历史运行和检查产物在本地保留；不批量纳入Git
+/history/*/experiments/
+/history/*/data/
+/history/*/artifacts/
+# 原本未跟踪的进度报告仍只在本地保留
+/history/*/reports/lif_generalization_progress_20261005.*
+/pytest-cache-files-*/
+*.log
+.DS_Store
+Thumbs.db

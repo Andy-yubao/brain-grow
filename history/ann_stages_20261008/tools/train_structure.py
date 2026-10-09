@@ -1,0 +1,445 @@
+"""固定预算五臂结构比较，候选适应占用普通更新额度，确认集最后读取。"""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import random
+import time
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import numpy as np
+import torch
+from torch.nn import functional as F
+
+from braingrow.codec import decode_model, encode_model, export_stats
+from braingrow.datasets import load_bundle
+from braingrow.models import StructuredMLP, ConvReference1D, ConvReference2D
+from braingrow.structural import CandidateTransaction, StructureController
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_FILES = ("tools/train_structure.py", "src/braingrow/models.py", "src/braingrow/codec.py",
+                "src/braingrow/datasets.py", "src/braingrow/structural.py")
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)+"\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def save_checkpoint(path, value):
+    temporary = path.with_suffix(".tmp")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def rng_state():
+    return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+
+
+def restore_rng(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+
+
+def pid_alive(pid):
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            if ctypes.get_last_error() == 87:
+                return False
+            raise PermissionError("无法只读核实运行锁进程，拒绝猜测或重复启动")
+        try:
+            code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                raise OSError("读取运行锁进程状态失败")
+            return code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def metrics(logits, labels):
+    labels = np.asarray(labels)
+    logits = np.asarray(logits, dtype=np.float64)
+    shifted = logits-logits.max(axis=1, keepdims=True)
+    loss = np.log(np.exp(shifted).sum(axis=1))-shifted[np.arange(len(labels)), labels]
+    predictions = logits.argmax(axis=1)
+    confusion = np.zeros((logits.shape[1], logits.shape[1]), dtype=np.int64)
+    np.add.at(confusion, (labels, predictions), 1)
+    return {"samples": len(labels), "accuracy": float(np.mean(predictions == labels)),
+            "loss": float(loss.mean()), "confusion_matrix": confusion.tolist()}
+
+
+def evaluate(model, x, y, batch_size, ledger, purpose):
+    before = model.training
+    model.eval()
+    output = []
+    with torch.no_grad():
+        for start in range(0, len(x), batch_size):
+            scores = model(x[start:start+batch_size])
+            if not torch.isfinite(scores).all():
+                raise FloatingPointError(f"非有限输出: {purpose}")
+            output.append(scores.cpu().numpy())
+    model.train(before)
+    logits = np.concatenate(output)
+    ledger["evaluation_forward_samples"] += len(x)
+    ledger["evaluations"].append({"purpose": purpose, "samples": len(x)})
+    return metrics(logits, y.cpu().numpy()), logits
+
+
+def train_batch(model, optimizer, x, y, ledger, controller=None, candidate=False):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    loss = F.cross_entropy(model(x), y)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("训练损失非有限")
+    loss.backward()
+    if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+        raise FloatingPointError("训练梯度非有限")
+    if controller is not None and not candidate:
+        controller.observe_gradients(model)
+    optimizer.step()
+    ledger["optimization_forward_samples"] += len(x)
+    ledger["optimization_backward_samples"] += len(x)
+    ledger["attempted_updates"] += 1
+    ledger["candidate_updates"] += int(candidate)
+    return float(loss.detach())
+
+
+def encoded(model):
+    before = model.training
+    model.eval()
+    if isinstance(model, StructuredMLP):
+        payload = encode_model(model)
+    else:
+        # CNN参照保留架构说明与全部state；不与共享编码混淆为相同格式。
+        buffer = io.BytesIO()
+        torch.save({"architecture": type(model).__name__, "state": model.state_dict()}, buffer)
+        payload = buffer.getvalue()
+    model.train(before)
+    return payload
+
+
+def structure_stats(model, payload):
+    if isinstance(model, StructuredMLP):
+        result = export_stats(model, payload)
+        result["hidden_units"] = sum(model.widths[1:-1])
+        result["output_units"] = model.widths[-1]
+        result["total_computing_units"] = sum(model.widths[1:])
+        result["execution"] = "dense_gather_matmul_no_compute_reuse"
+        return result
+    return {"format": "torch_state_with_architecture", "export_bytes": len(payload),
+            "independent_parameters": sum(p.numel() for p in model.parameters()),
+            "execution": "predefined_convolution_reference", "learned_structure": False}
+
+
+def within(candidate, reference, config):
+    return (candidate["accuracy"] >= reference["accuracy"]-config["accuracy_tolerance"]
+            and candidate["loss"] <= reference["loss"]+config["loss_tolerance"])
+
+
+def select_screen(y, count):
+    labels = y.cpu().numpy()
+    classes = int(labels.max())+1
+    selections = []
+    for label in range(classes):
+        n = count//classes + int(label < count % classes)
+        selections.extend(np.flatnonzero(labels == label)[:n].tolist())
+    return torch.as_tensor(selections, device=y.device, dtype=torch.long)
+
+
+def perform_candidate(model, optimizer, controller, train_x, train_y, select_x, select_y,
+                      screen, reference, reference_screen, ledger, config, epoch):
+    proposal = controller.propose(model)
+    event = {"proposal": controller.proposals, "epoch": epoch, "kind": proposal.kind,
+             "edited_pairs_or_edges": proposal.count, "accepted": False}
+    if not proposal.count:
+        event["reason"] = "no_candidate"
+        train_batch(model, optimizer, train_x, train_y, ledger, controller)
+        return event
+    previous_bytes = len(encoded(model))
+    # 候选提议游标已前进，scheduler由epoch固定决定且此事务不改变它。
+    with CandidateTransaction(model, optimizer, controller) as transaction:
+        controller.apply(model, optimizer, proposal)
+        train_batch(model, optimizer, train_x, train_y, ledger, candidate=True)
+        new_payload = encoded(model)
+        event.update(previous_export_bytes=previous_bytes, proposed_export_bytes=len(new_payload))
+        if len(new_payload) >= previous_bytes:
+            event["reason"] = "no_real_storage_gain"
+        else:
+            screened, _ = evaluate(model, select_x[screen], select_y[screen], config["evaluation_batch_size"],
+                                   ledger, "candidate_screen")
+            event["screen"] = screened
+            if not within(screened, reference_screen, config):
+                event["reason"] = "screen_exceeds_fc_tolerance"
+            else:
+                full, _ = evaluate(model, select_x, select_y, config["evaluation_batch_size"], ledger,
+                                   "candidate_full_select")
+                event["select"] = full
+                if within(full, reference, config):
+                    event["accepted"] = True
+                    event["reason"] = "storage_gain_and_task_preservation"
+                    controller.accepted += 1
+                    transaction.commit()
+                else:
+                    event["reason"] = "full_select_exceeds_fc_tolerance"
+        if not event["accepted"]:
+            ledger["rolled_back_updates"] += 1
+    return event
+
+
+def initialize(arm, spec, seed, device):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if arm == "cnn":
+        model = ConvReference1D() if spec["widths"][0] == 64 else ConvReference2D()
+    else:
+        model = StructuredMLP(spec["widths"])
+    return model.to(device)
+
+
+def run(args):
+    session_started = time.perf_counter()
+    config = json.loads((ROOT/args.config).read_text(encoding="utf-8"))
+    spec = config["tasks"][args.task]
+    folder = ROOT/"experiments"/"runs"/config["version"]/args.task
+    folder.mkdir(parents=True, exist_ok=True)
+    lock = folder/"running.lock"
+    if lock.exists():
+        pid = int(lock.read_text())
+        if pid_alive(pid):
+            raise RuntimeError(f"运行锁仍活动，拒绝重复启动PID={pid}")
+        lock.unlink()
+    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    try:
+        device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else
+                              "cpu" if args.device == "auto" else args.device)
+        torch.set_num_threads(2)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True)
+        provenance = {"config": config, "task": args.task,
+                      "source_sha256": {p: sha(ROOT/p) for p in SOURCE_FILES},
+                      "device": str(device), "torch": torch.__version__}
+        registration = folder/"registration.json"
+        if registration.exists():
+            saved = json.loads(registration.read_text(encoding="utf-8"))
+            if saved != provenance:
+                raise RuntimeError("实现或配置发生变化，拒绝混入原实验；请登记新的版本")
+            if not args.resume:
+                raise RuntimeError("已存在运行，需--resume，不能覆盖")
+        else:
+            write_json(registration, provenance)
+        if (folder/"summary.json").exists():
+            finished = json.loads((folder/"summary.json").read_text(encoding="utf-8"))
+            print(json.dumps({"already_complete": True, "gate": finished["gate"]}, ensure_ascii=False), flush=True)
+            return
+        write_json(folder/"running.json", {"pid": os.getpid(), "device": str(device), "task": args.task})
+        task = "mnist" if args.task == "mnist_static" else args.task
+        bundle = load_bundle(task, include_confirm=False)
+        write_json(folder/"data_manifest.json", bundle.manifest)
+        fit_x = torch.from_numpy(bundle.fit_x).to(device)
+        fit_y = torch.from_numpy(bundle.fit_y).to(device)
+        select_x = torch.from_numpy(bundle.select_x).to(device)
+        select_y = torch.from_numpy(bundle.select_y).to(device)
+        screen = select_screen(select_y, config["screen_samples"])
+        if not (folder/"startup.json").exists():
+            startup_model = initialize("fc", spec, config["model_seed"], device)
+            loss = F.cross_entropy(startup_model(fit_x[:8]), fit_y[:8])
+            loss.backward()
+            valid = bool(torch.isfinite(loss)) and all(p.grad is not None and torch.isfinite(p.grad).all()
+                                                     for p in startup_model.parameters())
+            write_json(folder/"startup.json", {"ok": valid, "forward_samples": 8,
+                       "backward_samples": 8, "updates": 0, "model_seed": 11,
+                       "device": str(device), "loss": float(loss.detach())})
+            del startup_model
+            if not valid:
+                raise FloatingPointError("8样本启动检查失败")
+        elif not json.loads((folder/"startup.json").read_text())["ok"]:
+            raise RuntimeError("此前启动检查失败")
+        completed = {}
+        for arm in config["arms"]:
+            arm_folder = folder/arm
+            arm_folder.mkdir(exist_ok=True)
+            checkpoint_path = arm_folder/"resume.pt"
+            model = initialize(arm, spec, config["model_seed"], device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"],
+                                          weight_decay=config["weight_decay"])
+            controller = StructureController(model, arm, config["edit_fraction"], config["gradient_decay"]) \
+                if arm in ("prune", "share", "joint") else None
+            rows, events, next_epoch = [], [], 1
+            ledger = {"optimization_forward_samples": 0, "optimization_backward_samples": 0,
+                      "attempted_updates": 0, "candidate_updates": 0, "rolled_back_updates": 0,
+                      "evaluation_forward_samples": 0, "evaluations": []}
+            arm_wall = 0.0
+            if checkpoint_path.exists():
+                saved = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                state = saved
+                model.load_state_dict(saved["model"])
+                optimizer.load_state_dict(saved["optimizer"])
+                if controller is not None:
+                    controller.load_state_dict(saved["controller"])
+                rows, events, ledger = saved["rows"], saved["events"], saved["ledger"]
+                next_epoch, arm_wall = saved["next_epoch"], saved["wall_seconds"]
+                restore_rng(saved["rng"])
+            initial_payload = encoded(model) if next_epoch == 1 else None
+            if initial_payload is not None:
+                (arm_folder/"initial_model.bgs").write_bytes(initial_payload)
+            reference_rows = completed["fc"]["rows"] if arm != "fc" else None
+            for epoch in range(next_epoch, spec["epochs"]+1):
+                synchronize(device)
+                started = time.perf_counter()
+                for group in optimizer.param_groups:
+                    group["lr"] = config["learning_rate"] * .5**sum(epoch >= point for point in spec["lr_milestones"])
+                order = np.random.default_rng(np.random.SeedSequence([config["data_seed"], epoch])).permutation(len(fit_x))
+                batches = [order[start:start+config["batch_size"]]
+                           for start in range(0, len(order), config["batch_size"])]
+                proposals_this_epoch = min(2, spec["max_proposals"]-controller.proposals) \
+                    if controller is not None and epoch > spec["warmup_epochs"] else 0
+                for ids in batches[:len(batches)-proposals_this_epoch]:
+                    index = torch.as_tensor(ids, device=device)
+                    train_batch(model, optimizer, fit_x[index], fit_y[index], ledger, controller)
+                if proposals_this_epoch:
+                    reference = reference_rows[epoch-1]["select"]
+                    reference_screen = reference_rows[epoch-1]["screen"]
+                    for ids in batches[-proposals_this_epoch:]:
+                        index = torch.as_tensor(ids, device=device)
+                        event = perform_candidate(model, optimizer, controller, fit_x[index], fit_y[index],
+                                                  select_x, select_y, screen, reference, reference_screen,
+                                                  ledger, config, epoch)
+                        events.append(event)
+                        print(json.dumps({"arm": arm, "candidate": event}, ensure_ascii=False), flush=True)
+                selected, scores = evaluate(model, select_x, select_y, config["evaluation_batch_size"], ledger,
+                                            "epoch_select")
+                payload = encoded(model)
+                synchronize(device)
+                elapsed = time.perf_counter()-started
+                arm_wall += elapsed
+                row = {"epoch": epoch, "select": selected,
+                       "screen": metrics(scores[screen.cpu().numpy()], bundle.select_y[screen.cpu().numpy()]),
+                       "structure": structure_stats(model, payload), "wall_seconds": elapsed,
+                       "learning_rate": optimizer.param_groups[0]["lr"]}
+                rows.append(row)
+                np.savez_compressed(arm_folder/f"select_{epoch:03d}.npz", logits=scores, labels=bundle.select_y)
+                state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                         "controller": controller.state_dict() if controller is not None else None,
+                         "rows": rows, "events": events, "ledger": ledger, "rng": rng_state(),
+                         "next_epoch": epoch+1, "wall_seconds": arm_wall}
+                save_checkpoint(checkpoint_path, state)
+                write_json(arm_folder/"progress.json", {"rows": rows, "events": events, "ledger": ledger,
+                                                       "wall_seconds": arm_wall})
+                print(json.dumps({"arm": arm, "epoch": epoch, "select_accuracy": selected["accuracy"],
+                      "select_loss": selected["loss"], "export_bytes": len(payload)}, ensure_ascii=False), flush=True)
+                if (folder/"request_stop").exists():
+                    print("安全暂停于完整轮边界；使用--resume继续", flush=True)
+                    return
+            # 冻结最终轮，不用控制集择优挑一轮。
+            payload = encoded(model)
+            (arm_folder/"final_model.bgs").write_bytes(payload)
+            if not (arm_folder/"fit_final.npz").exists():
+                fit_metrics, fit_scores = evaluate(model, fit_x, fit_y, config["evaluation_batch_size"], ledger,
+                                                  "frozen_fit")
+                np.savez_compressed(arm_folder/"fit_final.npz", logits=fit_scores, labels=bundle.fit_y)
+            else:
+                with np.load(arm_folder/"fit_final.npz") as cache:
+                    fit_metrics = metrics(cache["logits"], cache["labels"])
+            result = {"arm": arm, "rows": rows, "events": events, "ledger": ledger,
+                      "wall_seconds": arm_wall, "fit": fit_metrics, "structure": structure_stats(model, payload),
+                      "final_epoch": spec["epochs"], "frozen": True}
+            # 最终评价账本也写回恢复检查点，完成臂不重训或重复前向。
+            state.update(ledger=ledger, rng=rng_state())
+            save_checkpoint(checkpoint_path, state)
+            write_json(arm_folder/"result.json", result)
+            completed[arm] = result
+            del model, optimizer, controller
+        # 所有臂先冻结，才解包确认样本；此后不修改方法/候选。
+        write_json(folder/"freeze.json", {"arms": list(completed), "epochs": spec["epochs"],
+                                          "source_sha256": provenance["source_sha256"]})
+        confirmed = load_bundle(task, include_confirm=True)
+        confirm_x = torch.from_numpy(confirmed.confirm_x).to(device)
+        confirm_y = torch.from_numpy(confirmed.confirm_y).to(device)
+        for arm, result in completed.items():
+            arm_folder = folder/arm
+            if not (arm_folder/"confirm_final.npz").exists():
+                model = initialize(arm, spec, config["model_seed"], device)
+                saved = torch.load(arm_folder/"resume.pt", map_location=device, weights_only=False)
+                model.load_state_dict(saved["model"])
+                confirmation, scores = evaluate(model, confirm_x, confirm_y, config["evaluation_batch_size"],
+                                                result["ledger"], "frozen_confirmation")
+                np.savez_compressed(arm_folder/"confirm_final.npz", logits=scores, labels=confirmed.confirm_y)
+                saved["ledger"] = result["ledger"]
+                save_checkpoint(arm_folder/"resume.pt", saved)
+                del model
+            else:
+                with np.load(arm_folder/"confirm_final.npz") as cache:
+                    confirmation = metrics(cache["logits"], cache["labels"])
+            result["confirmation"] = confirmation
+            write_json(arm_folder/"result.json", result)
+        fc, joint = completed["fc"], completed["joint"]
+        reduction = 1-joint["structure"]["export_bytes"]/fc["structure"]["export_bytes"]
+        ratio = joint["wall_seconds"]/fc["wall_seconds"]
+        gate = {"fc_learned": fc["rows"][-1]["select"]["accuracy"] >= spec["learning_floor"],
+                "task_preserved": within(joint["rows"][-1]["select"], fc["rows"][-1]["select"], config),
+                "storage_reduction": reduction, "storage_passed": reduction >= config["minimum_storage_reduction"],
+                "nonzero_shared_groups": joint["structure"]["model_total"]["nonzero_shared_groups"],
+                "runtime_ratio": ratio, "runtime_passed": ratio <= config["maximum_runtime_ratio"]}
+        gate["continue"] = bool(gate["fc_learned"] and gate["task_preserved"] and gate["storage_passed"]
+                                and gate["nonzero_shared_groups"] and gate["runtime_passed"])
+        summary = {"task": args.task, "registration": provenance, "arms": completed, "gate": gate,
+                   "confirmation_status": "synthetic_frozen" if args.task.startswith("synthetic") else "historically_explored_ids",
+                   "current_session_wall_seconds": time.perf_counter()-session_started,
+                   "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None}
+        write_json(folder/"summary.json", summary)
+        print(json.dumps({"complete": True, "task": args.task, "gate": gate}, ensure_ascii=False), flush=True)
+    finally:
+        lock.unlink(missing_ok=True)
+        write_json(folder/"running.json", {"pid": None, "status": "exited", "task": args.task})
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=["synthetic_translated", "synthetic_fixed", "mnist_static"], required=True)
+    parser.add_argument("--config", default="configs/structural_v1.json")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--resume", action="store_true")
+    run(parser.parse_args())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+name: braingrow
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy>=1.26,<3
+  - pillow>=10,<13
+  - pytest>=8,<10

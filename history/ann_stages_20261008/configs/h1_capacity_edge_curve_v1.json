@@ -1,0 +1,20 @@
+{
+  "version": "h1_capacity_edge_curve_v1",
+  "model_seed": 11,
+  "data_seed": 20261004,
+  "cnn_effective_edges": 433680,
+  "target_edge_counts": [4336800, 2168400, 867360, 433680],
+  "epochs_per_stage": 8,
+  "epochs": 32,
+  "parent_epoch": 16,
+  "batch_size": 64,
+  "evaluation_batch_size": 512,
+  "learning_rate": 0.0001,
+  "minimum_learning_rate": 0.0001,
+  "sensitivity_ema": 0.9,
+  "collapse_fit_accuracy": 0.8,
+  "collapse_validation_accuracy": 0.75,
+  "collapse_consecutive_epochs": 2,
+  "wall_seconds_per_arm": 1200,
+  "peak_memory_limit_bytes": 8589934592
+}

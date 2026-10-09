@@ -1,0 +1,14 @@
+{
+  "version": "h1_capacity_deployment_v1",
+  "batch_sizes": [1, 64],
+  "evaluation_batch_size": 64,
+  "warmup_iterations": 10,
+  "timing_iterations": 100,
+  "absolute_error_limit": 0.001,
+  "worker_seconds": 120,
+  "session_seconds": 1200,
+  "peak_cuda_memory_limit_bytes": 8589934592,
+  "cpu_threads": 2,
+  "index_dtype": "int32",
+  "precision": "FP32"
+}

@@ -1,0 +1,22 @@
+# 环境、凭据及生成物
+.venv/
+.conda/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.env
+.env.*
+!.env.example
+/data/
+/artifacts/
+/tmp/
+/.tmp/
+/experiments/runs/
+*.log
+.DS_Store
+Thumbs.db

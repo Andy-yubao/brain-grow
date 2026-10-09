@@ -1,0 +1,20 @@
+{
+  "version": "h1_capacity_pruning_v1",
+  "model_seed": 11,
+  "data_seed": 20261004,
+  "epochs": 8,
+  "candidate_epochs": [2, 4, 6, 8],
+  "prune_fraction": 0.2,
+  "sensitivity_ema": 0.9,
+  "learning_rate": 0.0002,
+  "minimum_learning_rate": 0.00001,
+  "weight_decay": 0.0001,
+  "accuracy_floor": 0.965,
+  "accuracy_drop": 0.005,
+  "loss_increase": 0.025,
+  "storage_reduction": 0.2,
+  "batch_size": 64,
+  "evaluation_batch_size": 512,
+  "wall_seconds_per_arm": 1200,
+  "peak_memory_limit_bytes": 8589934592
+}
